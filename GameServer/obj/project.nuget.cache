@@ -1,0 +1,23 @@
+{
+  "version": 2,
+  "dgSpecHash": "k2aC8ZSHrjw=",
+  "success": true,
+  "projectFilePath": "C:\\Users\\kosab\\Documents\\multiplayergame\\GameServer\\GameServer.csproj",
+  "expectedPackageFiles": [
+    "C:\\Users\\kosab\\.nuget\\packages\\microsoft.aspnetcore.signalr\\1.1.0\\microsoft.aspnetcore.signalr.1.1.0.nupkg.sha512"
+  ],
+  "logs": [
+    {
+      "code": "NU1510",
+      "level": "Warning",
+      "message": "PackageReference Microsoft.AspNetCore.SignalR will not be pruned. Consider removing this package from your dependencies, as it is likely unnecessary.",
+      "projectPath": "C:\\Users\\kosab\\Documents\\multiplayergame\\GameServer\\GameServer.csproj",
+      "warningLevel": 1,
+      "filePath": "C:\\Users\\kosab\\Documents\\multiplayergame\\GameServer\\GameServer.csproj",
+      "libraryId": "Microsoft.AspNetCore.SignalR",
+      "targetGraphs": [
+        "net10.0"
+      ]
+    }
+  ]
+}

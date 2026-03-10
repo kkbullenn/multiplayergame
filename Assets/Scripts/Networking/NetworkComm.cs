@@ -1,139 +1,155 @@
-using System;
-using System.Net;
-using System.Net.Sockets;
-using System.Text;
-using System.Collections.Generic;
+﻿using System;
+using System.Threading;
+using System.Threading.Tasks;
 using UnityEngine;
+
+// SignalR client NuGet package — add via NuGetForUnity (see README for setup steps)
+using Microsoft.AspNetCore.SignalR.Client;
 
 namespace MulticastGame.Networking
 {
-    /// Handles UDP multicast communication between game instances.
+    /// <summary>
+    /// WebSocket-based network layer using SignalR.
+    /// Drop-in replacement for the UDP multicast NetworkComm.cs —
+    /// exposes the identical public API so MoveCubes.cs requires zero changes.
+    ///
+    /// Architecture:
+    ///   Unity client  →  SignalR Hub (GameServer)  →  all other Unity clients
+    ///
+    /// To swap back to multicast: delete this file, rename NetworkCommUDP.cs → NetworkComm.cs.
+    /// </summary>
     public class NetworkComm
     {
-        // multicast group and port configuration
-        private const string MULTICAST_GROUP = "230.0.0.1";
-        private const int MULTICAST_PORT = 11000;
-        private const int BUFFER_SIZE = 2048;
+        // -----------------------------------------------------------------------
+        // Configuration — set SERVER_IP to the LAN IP of whichever machine
+        // is running the GameServer before hitting Play.
+        // -----------------------------------------------------------------------
+        private const string SERVER_IP = "localhost"; // ← change to host machine's LAN IP
+        private const int SERVER_PORT = 7777;
+        private const string HUB_PATH = "/gameHub";
 
-        // dupe detection: track last seen sequence number for each sender
-        private readonly Dictionary<string, int> _lastSeqBySender = new Dictionary<string, int>();
-        private readonly object _seqLock = new object();
+        private string HubUrl => $"http://{SERVER_IP}:{SERVER_PORT}{HUB_PATH}";
 
-        // sequence number for outgoing messages (incremented with each send)
-        private int _outSeq = 0;
-
+        // -----------------------------------------------------------------------
+        // Public event — identical signature to the UDP version
+        // -----------------------------------------------------------------------
         public delegate void MsgHandler(string senderId, string payload);
         public event MsgHandler MsgReceived;
 
+        // Connection state
+        private HubConnection _connection;
+        private bool _isConnected = false;
+        public bool IsConnected => _isConnected;
+
         // -----------------------------------------------------------------------
-        // Send
+        // Connect  (call once from MoveCubes.Start, replaces the bg thread)
         // -----------------------------------------------------------------------
 
         /// <summary>
-        /// Broadcasts a message to the multicast group.
-        /// Wire format:  SEQ=<n>|FROM=<senderId>|<payload>
+        /// Builds the SignalR connection and starts it asynchronously.
+        /// Safe to call from Unity's main thread.
+        /// </summary>
+        public void Connect()
+        {
+            _connection = new HubConnectionBuilder()
+                .WithUrl(HubUrl)
+                .WithAutomaticReconnect(new[]
+                {
+                    TimeSpan.Zero,
+                    TimeSpan.FromSeconds(2),
+                    TimeSpan.FromSeconds(5),
+                    TimeSpan.FromSeconds(10)
+                })
+                .Build();
+
+            // Register incoming message handler
+            _connection.On<string, string>("ReceiveGameMessage", (senderId, payload) =>
+            {
+                MsgReceived?.Invoke(senderId, payload);
+            });
+
+            // Handle disconnection events
+            _connection.Closed += async (error) =>
+            {
+                _isConnected = false;
+                Debug.LogWarning($"[NetworkCommWS] Connection closed: {error?.Message}");
+                await Task.Delay(2000);
+            };
+
+            _connection.Reconnecting += (error) =>
+            {
+                _isConnected = false;
+                Debug.LogWarning($"[NetworkCommWS] Reconnecting: {error?.Message}");
+                return Task.CompletedTask;
+            };
+
+            _connection.Reconnected += (connectionId) =>
+            {
+                _isConnected = true;
+                Debug.Log($"[NetworkCommWS] Reconnected: {connectionId}");
+                return Task.CompletedTask;
+            };
+
+            // Start connection on a background thread so Unity doesn't freeze
+            Task.Run(async () =>
+            {
+                try
+                {
+                    await _connection.StartAsync();
+                    _isConnected = true;
+                    Debug.Log($"[NetworkCommWS] Connected to {HubUrl}");
+                }
+                catch (Exception e)
+                {
+                    _isConnected = false;
+                    Debug.LogError($"[NetworkCommWS] Failed to connect to {HubUrl}: {e.Message}");
+                    Debug.LogError("[NetworkCommWS] Make sure the GameServer is running first.");
+                }
+            });
+        }
+
+        // -----------------------------------------------------------------------
+        // Send  (identical signature to UDP version)
+        // -----------------------------------------------------------------------
+
+        /// <summary>
+        /// Sends a message to all other connected clients via the SignalR hub.
+        /// Fire-and-forget — mirrors the UDP send behaviour.
         /// </summary>
         public void SendMessage(string senderId, string payload)
         {
-            int seq;
-            lock (_seqLock) { seq = ++_outSeq; }
+            if (_connection == null || _connection.State != HubConnectionState.Connected)
+                return;
 
-            string wire = $"SEQ={seq}|FROM={senderId}|{payload}";
-            byte[] data = Encoding.ASCII.GetBytes(wire);
-
-            try
-            {
-                using Socket sock = new Socket(AddressFamily.InterNetwork,
-                                               SocketType.Dgram, ProtocolType.Udp);
-                IPEndPoint ep = new IPEndPoint(IPAddress.Parse(MULTICAST_GROUP), MULTICAST_PORT);
-                sock.SendTo(data, ep);
-            }
-            catch (Exception e)
-            {
-                Debug.LogWarning($"[NetworkComm] SendMessage error: {e.Message}");
-            }
+            // Fire-and-forget async send — doesn't block Unity's main thread
+            _ = _connection.InvokeAsync("SendGameMessage", senderId, payload)
+                .ContinueWith(t =>
+                {
+                    if (t.IsFaulted)
+                        Debug.LogWarning($"[NetworkCommWS] SendMessage failed: {t.Exception?.Message}");
+                });
         }
 
         // -----------------------------------------------------------------------
-        // Receive  (run on a background thread)
+        // Disconnect  (call from MoveCubes.OnDisable)
         // -----------------------------------------------------------------------
 
         /// <summary>
-        /// Blocking receive loop. Intended to run on a dedicated background thread.
-        /// Fires MsgReceived for every valid, non-duplicate packet.
+        /// Gracefully closes the SignalR connection.
         /// </summary>
-        public void ReceiveMessages()
+        public void Disconnect()
         {
-            Socket sock = null;
-            try
-            {
-                sock = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
-                sock.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, true);
-
-                EndPoint localEP = new IPEndPoint(IPAddress.Any, MULTICAST_PORT);
-                sock.Bind(localEP);
-
-                MulticastOption mcastOpt = new MulticastOption(
-                    IPAddress.Parse(MULTICAST_GROUP), IPAddress.Any);
-                sock.SetSocketOption(SocketOptionLevel.IP, SocketOptionName.AddMembership, mcastOpt);
-
-                byte[] buf = new byte[BUFFER_SIZE];
-                EndPoint remoteEP = new IPEndPoint(IPAddress.Any, 0);
-
-                while (true)
-                {
-                    int received = sock.ReceiveFrom(buf, ref remoteEP);
-                    string raw = Encoding.ASCII.GetString(buf, 0, received);
-                    ProcessIncoming(raw);
-                }
-            }
-            catch (Exception e)
-            {
-                Debug.LogWarning($"[NetworkComm] ReceiveMessages error: {e.Message}");
-            }
-            finally
-            {
-                sock?.Close();
-            }
+            if (_connection == null) return;
+            _ = _connection.StopAsync();
+            _isConnected = false;
+            Debug.Log("[NetworkCommWS] Disconnected.");
         }
 
         // -----------------------------------------------------------------------
-        // Internal packet processing
+        // Legacy stub — ReceiveMessages() was the UDP background thread entry point.
+        // Kept so MoveCubes.cs compiles without changes if it still references it.
         // -----------------------------------------------------------------------
-
-        private void ProcessIncoming(string raw)
-        {
-            // Expected format:  SEQ=<n>|FROM=<id>|<payload>
-            try
-            {
-                // Split into at most 3 parts so payload can contain '|'
-                string[] parts = raw.Split('|', 3);
-                if (parts.Length < 3) return;
-
-                if (!parts[0].StartsWith("SEQ=")) return;
-                if (!int.TryParse(parts[0].Substring(4), out int seq)) return;
-
-                if (!parts[1].StartsWith("FROM=")) return;
-                string senderId = parts[1].Substring(5).Trim('\0');
-
-                string payload = parts[2].Trim('\0');
-
-                // --- Duplicate / out-of-order detection ---
-                lock (_seqLock)
-                {
-                    if (_lastSeqBySender.TryGetValue(senderId, out int lastSeen))
-                    {
-                        if (seq <= lastSeen) return; // duplicate or old packet � discard
-                    }
-                    _lastSeqBySender[senderId] = seq;
-                }
-
-                MsgReceived?.Invoke(senderId, payload);
-            }
-            catch (Exception e)
-            {
-                Debug.LogWarning($"[NetworkComm] ProcessIncoming error: {e.Message}");
-            }
-        }
+        [Obsolete("WebSocket version uses Connect() instead. This method is a no-op.")]
+        public void ReceiveMessages() { }
     }
 }

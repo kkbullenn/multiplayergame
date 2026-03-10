@@ -1,6 +1,5 @@
 ﻿using System;
 using System.Collections.Generic;
-using System.Threading;
 using UnityEngine;
 
 using MulticastGame.Networking;
@@ -90,13 +89,14 @@ public class MoveCubes : MonoBehaviour
         _gameState.CubeLockChanged += OnCubeLockChanged;
 
         // --- Create materials ---
-        _defaultMaterial = new Material(Shader.Find("Standard"));
+        Shader shader = GetCompatibleShader();
+        _defaultMaterial = new Material(shader);
         _defaultMaterial.color = new Color(0.4f, 0.7f, 1.0f);
 
-        _selectedMaterial = new Material(Shader.Find("Standard"));
+        _selectedMaterial = new Material(shader);
         _selectedMaterial.color = new Color(0.2f, 1.0f, 0.5f);
 
-        _lockedByOtherMaterial = new Material(Shader.Find("Standard"));
+        _lockedByOtherMaterial = new Material(shader);
         _lockedByOtherMaterial.color = new Color(1.0f, 0.45f, 0.2f);
 
         // --- Spawn cubes ---
@@ -131,15 +131,10 @@ public class MoveCubes : MonoBehaviour
         // --- Networking layer ---
         _network = new NetworkComm();
         _network.MsgReceived += OnNetworkMessage; // fires on background thread
+        _network.Connect(); // WebSocket — connects to SignalR hub asynchronously
 
-        Thread recvThread = new Thread(_network.ReceiveMessages)
-        {
-            IsBackground = true,
-            Name = "MulticastReceive"
-        };
-        recvThread.Start();
-
-        _ui.IsConnected = true;
+        // IsConnected will flip to true once the hub handshake completes
+        _ui.IsConnected = false; // starts false, UIManager polls _network.IsConnected each frame
     }
 
     void Update()
@@ -161,6 +156,7 @@ public class MoveCubes : MonoBehaviour
 
         // --- Update GUI ---
         _ui.SelectedCubeId = _selectedCubeId ?? "none";
+        _ui.IsConnected = _network?.IsConnected ?? false; // reflects actual hub connection
     }
 
     void OnDisable()
@@ -175,7 +171,8 @@ public class MoveCubes : MonoBehaviour
             }
             _gameState.UnlockAll(_localPlayerId);
         }
-        Debug.Log("[MoveCubes] OnDisable — locks released.");
+        _network?.Disconnect();
+        Debug.Log("[MoveCubes] OnDisable — locks released, disconnected.");
     }
 
     // -----------------------------------------------------------------------
@@ -417,6 +414,15 @@ public class MoveCubes : MonoBehaviour
     // -----------------------------------------------------------------------
     // Scene helpers
     // -----------------------------------------------------------------------
+
+    private static Shader GetCompatibleShader()
+    {
+        Shader s;
+        s = Shader.Find("Universal Render Pipeline/Lit"); if (s != null) return s;
+        s = Shader.Find("Universal Render Pipeline/Unlit"); if (s != null) return s;
+        s = Shader.Find("Standard"); if (s != null) return s;
+        return Shader.Find("Diffuse");
+    }
 
     private void CreateLabel(GameObject parent, string text)
     {
